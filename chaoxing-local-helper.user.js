@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通本地学习助手
 // @namespace    local.chaoxing.study-helper
-// @version      0.7.7
+// @version      0.8.0
 // @description  本地媒体控制、播放中弹题与章节测验的 DeepSeek 辅助
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        https://mooc1.chaoxing.com/mooc-ans/knowledge/*
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  document.documentElement.dataset.cxLocalHelperVersion = '0.7.7';
+  document.documentElement.dataset.cxLocalHelperVersion = '0.8.0';
 
   const STORE = 'cx-local-helper-bank-v1';
   const OPTIONS = 'cx-local-helper-options-v1';
@@ -49,6 +49,7 @@
   let autoWorking = false;
   let flowQuizTimer;
   let flowButton;
+  let mediaFirstButton;
   let flowMediaAttempted = new WeakSet();
   let flowEndAnnounced = false;
   let mediaPermissionTimer;
@@ -58,11 +59,34 @@
   let popupLastFailure = '';
   let popupBadge;
 
-  function isFlowOn() {
+  function flowState() {
     try {
       const saved = JSON.parse(sessionStorage.getItem(FLOW_KEY) || 'null');
-      return !!saved && saved.expiresAt > Date.now();
-    } catch { return false; }
+      return saved?.expiresAt > Date.now() ? saved : null;
+    } catch { return null; }
+  }
+
+  function isFlowOn() {
+    return !!flowState();
+  }
+
+  function updateFlow(patch) {
+    const current = flowState();
+    if (!current) return;
+    sessionStorage.setItem(FLOW_KEY, JSON.stringify({ ...current, ...patch }));
+  }
+
+  function mediaFirstPhase() {
+    const flow = flowState();
+    return flow?.mode === 'media-first' && flow.phase === 'media';
+  }
+
+  function completedChapterInMediaFirstQuiz() {
+    const flow = flowState();
+    if (flow?.mode !== 'media-first' || flow.phase !== 'quiz') return false;
+    const id = new URLSearchParams(location.search).get('knowledgeid');
+    try { return !!id && !!window.top.document.querySelector(`#cur${id} .icon_Completed`); }
+    catch { return false; }
   }
 
   function isMediaModule() {
@@ -79,17 +103,24 @@
     if (flowQuizTimer) clearTimeout(flowQuizTimer);
     if (mediaPermissionTimer) clearTimeout(mediaPermissionTimer);
     if (flowButton) flowButton.textContent = '开始连续学习';
+    if (mediaFirstButton) mediaFirstButton.textContent = '先看完媒体再做测验';
     message(reason);
     announceFlow('stopped', reason);
   }
 
-  function startFlow() {
-    sessionStorage.setItem(FLOW_KEY, JSON.stringify({ expiresAt: Date.now() + 10 * 60 * 60 * 1000 }));
+  function startFlow(mode = 'chapter') {
+    sessionStorage.setItem(FLOW_KEY, JSON.stringify({
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      mode, phase: mode === 'media-first' ? 'media' : 'chapter'
+    }));
     if (flowButton) flowButton.textContent = '停止连续学习';
-    message('连续学习已启动；会自动提交测验。');
+    if (mediaFirstButton) mediaFirstButton.textContent = '停止连续学习';
+    message(mode === 'media-first'
+      ? '先看完本课程媒体，再逐节处理测验；测验会自动提交。'
+      : '连续学习已启动；会自动提交测验。');
     announceFlow('started');
     if (isMediaModule()) startFlowMedia();
-    if (questionNodes().length) {
+    if (questionNodes().length && !mediaFirstPhase()) {
       queueAutomaticQuestions();
       scheduleFlowQuiz();
     }
@@ -354,7 +385,37 @@
     }
   }
 
-  function callDeepSeek(imageUrl, info, key, retry = false) {
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function requestDeepSeek(payload, key, onRetry = () => {}) {
+    const waits = [2000, 4000, 8000, 16000, 30000,
+      60000, 60000, 60000, 60000, 60000, 60000];
+    for (let attempt = 0; attempt <= waits.length; attempt++) {
+      try {
+        return await new Promise((resolve, reject) => GM_xmlhttpRequest({
+          method: 'POST', url: API_URL, anonymous: true,
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+          data: JSON.stringify(payload), timeout: 45000,
+          onload: response => {
+            if (response.status === 200) return resolve(response.responseText);
+            const error = new Error(`DeepSeek HTTP ${response.status}`);
+            error.retryable = [429, 500, 502, 503, 504].includes(response.status);
+            reject(error);
+          },
+          onerror: () => reject(Object.assign(new Error('网络请求失败'), { retryable: true })),
+          ontimeout: () => reject(Object.assign(new Error('请求超时'), { retryable: true }))
+        }));
+      } catch (error) {
+        if (!error.retryable || attempt === waits.length) throw error;
+        onRetry(`${error.message}，${Math.ceil(waits[attempt] / 1000)} 秒后重试（${attempt + 1}/${waits.length}）`);
+        await delay(waits[attempt]);
+      }
+    }
+  }
+
+  async function callDeepSeek(imageUrl, info, key, retry = false) {
     const kind = info.type === 'multi' ? '多选题' : '单选或判断题';
     const payload = {
       model: 'deepseek-flash',
@@ -370,38 +431,21 @@
       temperature: 0,
       max_tokens: retry ? 600 : 300
     };
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'POST',
-        url: API_URL,
-        anonymous: true,
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-        data: JSON.stringify(payload),
-        timeout: 45000,
-        onload: response => {
-          if (response.status !== 200) {
-            reject(new Error(`DeepSeek 返回 HTTP ${response.status}。`));
-            return;
-          }
-          try {
-            const body = JSON.parse(response.responseText);
-            const content = String(body.choices?.[0]?.message?.content || '').trim();
-            const clean = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-            const parsed = JSON.parse(clean);
-            const answer = answerLetters(parsed.answer);
-            if (!answer || (info.type !== 'multi' && answer.length !== 1) ||
-              ![...answer].every(letter => info.choices.some(choice => choiceLetter(choice) === letter))) {
-              throw new Error('模型未给出有效的选项字母');
-            }
-            resolve({ answer, reason: String(parsed.reason || '').slice(0, 180) });
-          } catch {
-            reject(new Error('模型未返回有效的 JSON 选项。'));
-          }
-        },
-        onerror: () => reject(new Error('网络请求失败。')),
-        ontimeout: () => reject(new Error('请求超时。'))
-      });
-    });
+    const responseText = await requestDeepSeek(payload, key, progress => message(`题目 ${info.id}：${progress}`));
+    try {
+      const body = JSON.parse(responseText);
+      const content = String(body.choices?.[0]?.message?.content || '').trim();
+      const clean = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      const parsed = JSON.parse(clean);
+      const answer = answerLetters(parsed.answer);
+      if (!answer || (info.type !== 'multi' && answer.length !== 1) ||
+        ![...answer].every(letter => info.choices.some(choice => choiceLetter(choice) === letter))) {
+        throw new Error('模型未给出有效的选项字母');
+      }
+      return { answer, reason: String(parsed.reason || '').slice(0, 180) };
+    } catch {
+      throw new Error('模型未返回有效的 JSON 选项。');
+    }
   }
 
   async function askAI(info, trigger) {
@@ -439,6 +483,7 @@
         selected ? '；已有人工选择，未覆盖' : '；请人工核对'}。`);
     } catch (error) {
       aiErrors.set(info.id, error.message);
+      autoAsked.delete(`${info.id}:${questionSignature(info)}`);
       renderQuestions();
       message(`题目 ${info.id}：${error.message}`);
     } finally {
@@ -448,7 +493,9 @@
   }
 
   function queueAutomaticQuestions() {
-    if (!(preferences.autoAskQuestions || isFlowOn()) || !questionList || !GM_getValue(API_KEY, '')) return;
+    if (mediaFirstPhase() || completedChapterInMediaFirstQuiz() ||
+      !(preferences.autoAskQuestions || isFlowOn()) ||
+      !questionList || !GM_getValue(API_KEY, '')) return;
     for (const node of questionNodes()) {
       const info = questionInfo(node);
       const signature = questionSignature(info);
@@ -465,7 +512,8 @@
     if (autoWorking) return;
     autoWorking = true;
     try {
-      while ((preferences.autoAskQuestions || isFlowOn()) && autoQueue.length) {
+      while (!mediaFirstPhase() && !completedChapterInMediaFirstQuiz() &&
+        (preferences.autoAskQuestions || isFlowOn()) && autoQueue.length) {
         const { id, signature } = autoQueue.shift();
         const node = document.getElementById(`question${id}`);
         if (!node) continue;
@@ -480,7 +528,8 @@
   }
 
   function scheduleFlowQuiz() {
-    if (!isFlowOn() || quizSubmitting || !questionNodes().length) return;
+    if (!isFlowOn() || mediaFirstPhase() || completedChapterInMediaFirstQuiz() ||
+      quizSubmitting || !questionNodes().length) return;
     clearTimeout(flowQuizTimer);
     const signature = questionNodes().map(node => `${node.id}:${questionSignature(questionInfo(node))}`).join('|');
     announceFlow('quiz-ready');
@@ -488,7 +537,7 @@
   }
 
   function completeFlowQuiz(expectedSignature) {
-    if (!isFlowOn() || quizSubmitting || autoWorking || autoQueue.length) return;
+    if (!isFlowOn() || mediaFirstPhase() || quizSubmitting || autoWorking || autoQueue.length) return;
     const infos = questionNodes().map(questionInfo);
     const signature = infos.map(info => `${info.node.id}:${questionSignature(info)}`).join('|');
     if (!infos.length || signature !== expectedSignature) return;
@@ -896,8 +945,12 @@
       if (isFlowOn()) stopFlow('连续学习已手动停止。');
       else startFlow();
     });
-    flowSection.append(flowButton,
-      element('div', '连续学习会在视频任务点完成后进入测验，自动填选并提交，再切到下一节；遇到错误会停止。', 'hint'));
+    mediaFirstButton = button(isFlowOn() ? '停止连续学习' : '先看完媒体再做测验', () => {
+      if (isFlowOn()) stopFlow('连续学习已手动停止。');
+      else startFlow('media-first');
+    });
+    flowSection.append(flowButton, mediaFirstButton,
+      element('div', '按节模式：每节媒体结束后做测验。先媒体模式：本课程媒体全部完成后，再逐节做未完成测验。两种模式都会自动提交；遇到无法确认的状态会停止。', 'hint'));
     panel.append(flowSection);
     status = element('div', '答案表和 AI 建议保存在本机；自动询问开启时会发送每道新题。', 'status');
     panel.append(status);
@@ -980,7 +1033,7 @@
           clearTimeout(timer);
           window.removeEventListener('message', onReply);
           resolve({ finished: event.data.finished === true, ready: event.data.ready === true,
-            num: event.data.num });
+            num: event.data.num, knowledgeid: event.data.knowledgeid });
         }
         window.addEventListener('message', onReply);
         card.postMessage({ source: 'cx-local-helper-flow', type: 'probe-job', requestId }, location.origin);
@@ -989,18 +1042,20 @@
 
     async function waitForCardFinished(expectedNum, timeout = 90000) {
       const started = Date.now();
+      const expectedId = currentChapterId();
       while (isFlowOn() && Date.now() - started < timeout) {
         const card = await probeCardStatus();
-        if (card?.num === expectedNum && card.finished) return true;
+        if (card?.num === expectedNum && card.knowledgeid === expectedId && card.finished) return true;
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
       return false;
     }
 
-    async function waitForCardNum(expectedNum, timeout = 12000) {
+    async function waitForCardNum(expectedNum, timeout = 12000, expectedId = currentChapterId()) {
       const started = Date.now();
       while (isFlowOn() && Date.now() - started < timeout) {
-        if ((await probeCardStatus())?.num === expectedNum) return true;
+        const card = await probeCardStatus();
+        if (card?.num === expectedNum && card.knowledgeid === expectedId) return true;
         await new Promise(resolve => setTimeout(resolve, 700));
       }
       return false;
@@ -1012,6 +1067,110 @@
       showFlow(reason);
     }
 
+    function currentChapterId() {
+      const cardSrc = document.querySelector('#iframe')?.getAttribute('src');
+      const fromCard = cardSrc ? new URL(cardSrc, location.href).searchParams.get('knowledgeid') : '';
+      return fromCard || new URLSearchParams(location.search).get('chapterId') || '';
+    }
+
+    function chapters() {
+      return [...document.querySelectorAll('[id^="cur"]')]
+        .filter(node => /^cur\d+$/.test(node.id))
+        .map(node => ({ id: node.id.slice(3), node,
+          done: !!node.querySelector('.icon_Completed') }));
+    }
+
+    async function showCard(num, expectedId = currentChapterId()) {
+      const current = await probeCardStatus();
+      if (current?.num === num && current.knowledgeid === expectedId) return true;
+      const card = document.querySelector(num === '0' ? '#dct1' : '#dct2');
+      if (!card) return false;
+      card.click();
+      if (await waitForCardNum(num, 15000, expectedId)) return true;
+      card.click();
+      return waitForCardNum(num, 15000, expectedId);
+    }
+
+    async function waitForReadyCard(num, id, timeout = 30000) {
+      const started = Date.now();
+      while (isFlowOn() && Date.now() - started < timeout) {
+        const card = await probeCardStatus();
+        if (card?.num === num && card.knowledgeid === id && card.ready) return card;
+        await delay(800);
+      }
+      return null;
+    }
+
+    async function goToChapter(id, num) {
+      if (!isFlowOn()) return false;
+      updateFlow({ targetChapterId: id });
+      if (currentChapterId() !== id) {
+        if (!document.querySelector(`#cur${id} .posCatalog_name`)) {
+          halt('目录中找不到下一节，连续学习已停止。'); return false;
+        }
+        for (let attempt = 0; attempt < 2 && currentChapterId() !== id; attempt++) {
+          document.querySelector(`#cur${id} .posCatalog_name`)?.click();
+          const started = Date.now();
+          while (isFlowOn() && currentChapterId() !== id && Date.now() - started < 12000) {
+            await delay(500);
+          }
+        }
+        if (currentChapterId() !== id) {
+          halt('章节跳转后页面未变化，连续学习已停止。');
+          return false;
+        }
+      }
+      updateFlow({ targetChapterId: null });
+      if (!await showCard(num, id)) {
+        halt(num === '0' ? '无法进入视频卡片，连续学习已停止。' : '无法进入测验卡片，连续学习已停止。');
+        return false;
+      }
+      return true;
+    }
+
+    async function resumeMediaFirst() {
+      if (busy || !isFlowOn()) return;
+      const flow = flowState();
+      if (flow?.mode !== 'media-first') return;
+      busy = true;
+      try {
+        const items = chapters();
+        if (!items.length) { halt('未找到课程目录，连续学习已停止。'); return; }
+        const phase = flow.phase;
+        const firstPending = items.find(item => !item.done);
+        if (!firstPending) { halt('本课程任务点已全部完成。'); return; }
+        const id = flow.targetChapterId ||
+          (phase === 'media' && flow.mediaInitialized ? currentChapterId() : firstPending.id);
+        if (phase === 'media') {
+          updateFlow({ mediaInitialized: true });
+          showFlow('先看完本课程媒体；正在检查当前节的视频任务点…');
+        } else {
+          showFlow('媒体阶段已结束；正在处理未完成的章节测验…');
+        }
+        if (!await goToChapter(id, phase === 'media' ? '0' : '1')) return;
+        const card = await waitForReadyCard(phase === 'media' ? '0' : '1', id);
+        if (!card) {
+          halt('当前任务点长时间未加载，连续学习已停止。');
+          return;
+        }
+        if (phase === 'media' && card?.finished) {
+          busy = false;
+          moveToQuiz();
+          return;
+        }
+        if (phase === 'quiz' && card?.finished) {
+          busy = false;
+          moveToNext();
+          return;
+        }
+        if (phase === 'quiz') {
+          quizTimer = setTimeout(() => {
+            if (isFlowOn()) halt('测验题目长时间未加载，连续学习已停止。');
+          }, 90000);
+        }
+      } finally { busy = false; }
+    }
+
     async function moveToQuiz() {
       if (busy || !isFlowOn()) return;
       busy = true;
@@ -1021,21 +1180,29 @@
         busy = false;
         return;
       }
-      const quiz = document.querySelector('#dct2');
-      if (!quiz) {
-        halt('没有找到章节测验，连续学习已停止。');
-        busy = false;
-        return;
-      }
-      quiz.click();
-      showFlow('正在切换到章节测验…');
-      if (!await waitForCardNum('1')) {
-        quiz.click();
-        if (!await waitForCardNum('1')) {
-          halt('未能进入章节测验，连续学习已停止。');
+      if (mediaFirstPhase()) {
+        const items = chapters();
+        const current = items.findIndex(item => item.id === currentChapterId());
+        const next = items.slice(current + 1).find(item => !item.done);
+        if (next) {
+          showFlow('本节媒体已完成，正在进入下一节媒体…');
           busy = false;
+          if (await goToChapter(next.id, '0')) await resumeMediaFirst();
           return;
         }
+        const firstPending = items.find(item => !item.done);
+        if (!firstPending) { halt('本课程任务点已全部完成。'); busy = false; return; }
+        updateFlow({ phase: 'quiz', targetChapterId: firstPending.id });
+        showFlow('全部媒体已检查完成，开始逐节处理测验…');
+        busy = false;
+        await resumeMediaFirst();
+        return;
+      }
+      showFlow('正在切换到章节测验…');
+      if (!await showCard('1')) {
+        halt('未能进入章节测验，连续学习已停止。');
+        busy = false;
+        return;
       }
       showFlow('已进入章节测验，等待题目加载…');
       quizTimer = setTimeout(() => {
@@ -1049,40 +1216,45 @@
       busy = true;
       clearTimeout(quizTimer);
       const confirmStarted = Date.now();
-      while (isFlowOn() && Date.now() - confirmStarted < 5000) {
+      while (isFlowOn() && Date.now() - confirmStarted < 15000) {
         const prompt = document.querySelector('#popcontent');
         const okay = document.querySelector('#popok');
-        if (prompt && okay && /确认提交/.test(prompt.textContent || '') &&
+        if (prompt && okay && /提交|确认|确定/.test(prompt.textContent || '') &&
           okay.getBoundingClientRect().width > 0) {
           showFlow('确认提交章节测验…');
           okay.click();
           break;
         }
+        if ((await probeCardStatus())?.finished) break;
         await new Promise(resolve => setTimeout(resolve, 250));
       }
       showFlow('测验已提交，等待平台确认任务点完成…');
-      let confirmed = await waitForCardFinished('1', 10000);
+      let confirmed = await waitForCardFinished('1', 30000);
       for (let attempt = 0; !confirmed && attempt < 2 && isFlowOn(); attempt++) {
         const quiz = document.querySelector('#dct2');
         if (!quiz) break;
         showFlow('正在刷新测验任务点状态…');
         quiz.click();
-        confirmed = await waitForCardFinished('1', 15000);
+        confirmed = await waitForCardFinished('1', 30000);
       }
       if (!confirmed) {
         halt('测验提交后未确认完成，连续学习已停止，请检查页面。');
         busy = false;
         return;
       }
-      const next = document.querySelector('#prevNextFocusNext');
-      if (!next || getComputedStyle(next).display === 'none') {
-        halt('课程已到最后一节，连续学习已停止。');
+      const items = chapters();
+      const current = items.findIndex(item => item.id === currentChapterId());
+      const next = items.slice(current + 1).find(item =>
+        flowState()?.mode !== 'media-first' || !item.done);
+      if (!next) {
+        halt('已到课程末尾，连续学习已完成。');
         busy = false;
         return;
       }
-      showFlow('本节完成，正在进入下一节…');
-      next.click();
+      showFlow('本节完成，正在进入下一节并核对跳转…');
       busy = false;
+      await goToChapter(next.id, flowState()?.mode === 'media-first' ? '1' : '0');
+      if (flowState()?.mode === 'media-first') resumeMediaFirst();
     }
 
     window.addEventListener('message', event => {
@@ -1091,14 +1263,17 @@
       const { type, detail } = event.data;
       if (type === 'started') {
         showFlow('连续学习已启动，等待当前任务点完成…');
-        if (document.querySelector('#dct1.active')) {
+        if (flowState()?.mode === 'media-first') {
+          resumeMediaFirst();
+        } else if (document.querySelector('#dct1.active')) {
           probeCardStatus().then(card => {
             if (card?.num === '0' && card.finished && isFlowOn()) moveToQuiz();
           });
         }
       }
       else if (type === 'stopped') halt(detail || '连续学习已停止。');
-      else if (isFlowOn() && type === 'media-request' && !mediaProbeBusy) {
+      else if (isFlowOn() && flowState()?.phase !== 'quiz' &&
+        type === 'media-request' && !mediaProbeBusy) {
         mediaProbeBusy = true;
         probeCardStatus().then(card => {
           mediaProbeBusy = false;
@@ -1107,7 +1282,7 @@
           else event.source.postMessage({ source: 'cx-local-helper-flow', type: 'start-media' }, location.origin);
         });
       }
-      else if (isFlowOn() && type === 'video-ended') moveToQuiz();
+      else if (isFlowOn() && flowState()?.phase !== 'quiz' && type === 'video-ended') moveToQuiz();
       else if (isFlowOn() && type === 'quiz-ready') {
         clearTimeout(quizTimer);
         showFlow('题目已加载，等待 AI 建议并填选…');
@@ -1115,11 +1290,16 @@
       else if (isFlowOn() && type === 'quiz-submitted') moveToNext();
     });
 
-    if (isFlowOn()) showFlow('连续学习运行中，等待本节媒体加载…');
+    if (isFlowOn()) {
+      showFlow('连续学习运行中，等待当前任务点加载…');
+      if (flowState()?.mode === 'media-first') setTimeout(resumeMediaFirst, 0);
+    }
   }
 
   function initPlaybackQuiz() {
     const processed = new Set();
+    const retryAt = new Map();
+    const retryFailures = new Map();
     let busy = false;
     let lastProblem = '';
 
@@ -1211,7 +1391,7 @@
       popupBadge.textContent = text;
     }
 
-    function askPopup(question, key) {
+    async function askPopup(question, key) {
       const payload = {
         model: 'deepseek-flash',
         messages: [
@@ -1223,26 +1403,18 @@
         temperature: 0,
         max_tokens: 300
       };
-      return new Promise((resolve, reject) => GM_xmlhttpRequest({
-        method: 'POST', url: API_URL, anonymous: true,
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-        data: JSON.stringify(payload), timeout: 45000,
-        onload: response => {
-          if (response.status !== 200) return reject(new Error(`DeepSeek HTTP ${response.status}`));
-          try {
-            const content = JSON.parse(response.responseText).choices?.[0]?.message?.content || '';
-            const parsed = JSON.parse(content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
-            const answer = answerLetters(parsed.answer);
-            if (!answer || (question.kind !== 'multi' && answer.length !== 1) ||
-              [...answer].some(letter => !question.options.some(option => option.letter === letter))) {
-              throw new Error('模型未给出有效选项');
-            }
-            resolve(answer);
-          } catch { reject(new Error('模型回复无法识别')); }
-        },
-        onerror: () => reject(new Error('网络请求失败')),
-        ontimeout: () => reject(new Error('请求超时'))
-      }));
+      const responseText = await requestDeepSeek(payload, key, progress =>
+        showPopup(`播放中弹题：${progress}`));
+      try {
+        const content = JSON.parse(responseText).choices?.[0]?.message?.content || '';
+        const parsed = JSON.parse(content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
+        const answer = answerLetters(parsed.answer);
+        if (!answer || (question.kind !== 'multi' && answer.length !== 1) ||
+          [...answer].some(letter => !question.options.some(option => option.letter === letter))) {
+          throw new Error('模型未给出有效选项');
+        }
+        return answer;
+      } catch { throw new Error('模型回复无法识别'); }
     }
 
     function submitPopup(question, answer) {
@@ -1251,7 +1423,7 @@
         if (!option || !visible(option.node)) return false;
         const input = option.node.querySelector('input[type="radio"], input[type="checkbox"]');
         if (input) {
-          input.click();
+          if (!input.checked) input.click();
           if (!input.checked) option.node.querySelector('label')?.click();
           if (!input.checked) return false;
         } else {
@@ -1284,7 +1456,8 @@
       const docs = frameDocuments(document);
       const media = currentMedia(docs);
       const question = findPlaybackQuestion(docs, media);
-      if (!question || processed.has(question.signature)) return;
+      if (!question || processed.has(question.signature) ||
+        Date.now() < (retryAt.get(question.signature) || 0)) return;
       busy = true;
       popupBusy = true;
       popupLastSignature = question.signature;
@@ -1295,13 +1468,22 @@
         if (!submitPopup(question, answer)) throw new Error('未能选择答案');
         showPopup(`播放中弹题已选 ${answer}，正在核对是否继续播放。`);
         const submittedAt = Date.now();
-        while (visible(question.root) && question.media.paused && Date.now() - submittedAt < 8000) {
-          await new Promise(resolve => setTimeout(resolve, 400));
+        const clickedContinue = new WeakSet();
+        while (visible(question.root) && question.media.paused && Date.now() - submittedAt < 15000) {
+          const controls = [...(question.root.parentElement || question.root).querySelectorAll(
+            'button, a, input[type="button"], [role="button"]')];
+          const next = controls.find(node => visible(node) && !clickedContinue.has(node) &&
+            /^(继续|继续学习|继续播放|下一题|完成)$/.test(
+              (node.innerText || node.value || node.textContent || '').trim()));
+          if (next) { clickedContinue.add(next); next.click(); }
+          await delay(500);
         }
         if (visible(question.root) && question.media.paused) {
           throw new Error('题目仍在屏幕上，可能需要人工核对答案或提交');
         }
         processed.add(question.signature);
+        retryAt.delete(question.signature);
+        retryFailures.delete(question.signature);
         if (question.media.paused && !question.media.ended) {
           try { await question.media.play(); }
           catch { throw new Error('已作答，但浏览器阻止恢复播放'); }
@@ -1310,9 +1492,22 @@
       } catch (error) {
         lastProblem = error.message;
         popupLastFailure = `${question.signature}:${lastProblem}`;
-        processed.add(question.signature);
-        showPopup(`播放中弹题未自动完成：${lastProblem}。`);
-        if (isFlowOn()) stopFlow(`播放中弹题未完成：${lastProblem}。`);
+        if (error.retryable) {
+          const failures = (retryFailures.get(question.signature) || 0) + 1;
+          retryFailures.set(question.signature, failures);
+          if (failures < 3) {
+            retryAt.set(question.signature, Date.now() + 5 * 60 * 1000);
+            showPopup(`播放中弹题请求暂时失败：${lastProblem}；5 分钟后自动重试。`);
+          } else {
+            processed.add(question.signature);
+            showPopup(`播放中弹题连续请求失败：${lastProblem}。`);
+            if (isFlowOn()) stopFlow(`播放中弹题连续请求失败：${lastProblem}。`);
+          }
+        } else {
+          processed.add(question.signature);
+          showPopup(`播放中弹题未自动完成：${lastProblem}。`);
+          if (isFlowOn()) stopFlow(`播放中弹题未完成：${lastProblem}。`);
+        }
       } finally {
         busy = false;
         popupBusy = false;
@@ -1335,7 +1530,8 @@
         /已完成/.test(icon.getAttribute('aria-label') || ''));
       window.parent.postMessage({ source: 'cx-local-helper-flow', type: 'card-status',
         requestId: event.data.requestId, finished, ready: icons.length > 0,
-        num: new URLSearchParams(location.search).get('num') }, location.origin);
+        num: new URLSearchParams(location.search).get('num'),
+        knowledgeid: new URLSearchParams(location.search).get('knowledgeid') }, location.origin);
     });
   }
 
@@ -1360,6 +1556,7 @@
     window.addEventListener('storage', event => {
       if (event.key === FLOW_KEY && flowButton) {
         flowButton.textContent = isFlowOn() ? '停止连续学习' : '开始连续学习';
+        if (mediaFirstButton) mediaFirstButton.textContent = isFlowOn() ? '停止连续学习' : '先看完媒体再做测验';
       }
     });
   }
