@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通本地学习助手
 // @namespace    local.chaoxing.study-helper
-// @version      0.8.0
+// @version      0.8.9
 // @description  本地媒体控制、播放中弹题与章节测验的 DeepSeek 辅助
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        https://mooc1.chaoxing.com/mooc-ans/knowledge/*
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  document.documentElement.dataset.cxLocalHelperVersion = '0.8.0';
+  document.documentElement.dataset.cxLocalHelperVersion = '0.8.9';
 
   const STORE = 'cx-local-helper-bank-v1';
   const OPTIONS = 'cx-local-helper-options-v1';
@@ -643,22 +643,45 @@
       getComputedStyle(node).display !== 'none');
   }
 
-  function playMedia(media, automatic = false) {
+  async function playMedia(media, automatic = false) {
     if (!media) { message('当前页面没有视频或音频。'); return; }
     media.muted = automatic || !!preferences.mute;
-    return media.play()
-      .then(() => {
+    if (media.tagName === 'VIDEO') media.playsInline = true;
+    let lastError;
+    const attempts = automatic ? 4 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (automatic && media.paused) {
+        const player = media.closest('.video-js');
+        const playerButton = player?.querySelector('.vjs-big-play-button, .vjs-play-control');
+        if (playerButton) {
+          playerButton.click();
+          await delay(500);
+          if (!media.paused) {
+            renderMedia();
+            message('播放器正在播放。');
+            return;
+          }
+        }
+      }
+      try {
+        await media.play();
         renderMedia();
-        if (!media.paused) message(`正在播放${media.tagName === 'VIDEO' ? '视频' : '音频'}。`);
-      })
-      .catch(error => {
-        renderMedia();
-        const kind = media.tagName === 'VIDEO' ? '视频' : '音频';
-        message(error?.name === 'NotAllowedError'
-          ? `浏览器未允许播放${kind}，请点原播放器的播放键。`
-          : `${kind}未能播放：播放器或媒体资源可能尚未就绪。`);
-        if (automatic) stopFlow('自动播放受阻，连续学习已停止；请点原播放器的播放键。');
-      });
+        if (!media.paused) {
+          message(`正在播放${media.tagName === 'VIDEO' ? '视频' : '音频'}。`);
+          return;
+        }
+      } catch (error) { lastError = error; }
+      if (automatic && attempt < attempts - 1) {
+        message(`播放器尚未启动，${[2, 4, 8][attempt]} 秒后重试…`);
+        await delay([2000, 4000, 8000][attempt]);
+      }
+    }
+    renderMedia();
+    const kind = media.tagName === 'VIDEO' ? '视频' : '音频';
+    message(lastError?.name === 'NotAllowedError'
+      ? `浏览器未允许播放${kind}，请点原播放器的播放键。`
+      : `${kind}未能播放：播放器或媒体资源可能尚未就绪。`);
+    if (automatic) stopFlow(`自动播放未成功（${lastError?.name || '媒体未就绪'}），连续学习已停止；请点原播放器的播放键。`);
   }
 
   function startFlowMedia() {
@@ -1018,8 +1041,23 @@
     }
 
     function probeCardStatus() {
-      const card = document.querySelector('#iframe')?.contentWindow;
+      const frame = document.querySelector('#iframe');
+      const card = frame?.contentWindow;
       if (!card) return Promise.resolve(null);
+      try {
+        const doc = frame.contentDocument;
+        if (doc?.documentElement && doc.readyState !== 'loading') {
+          const icons = [...doc.querySelectorAll('.ans-job-icon')];
+          const query = new URL(frame.getAttribute('src'), location.href).searchParams;
+          return Promise.resolve({
+            finished: icons.length > 0 && icons.every(icon =>
+              icon.classList.contains('ans-job-finished') ||
+              /已完成/.test(icon.getAttribute('aria-label') || '')),
+            ready: icons.length > 0,
+            num: query.get('num'), knowledgeid: query.get('knowledgeid')
+          });
+        }
+      } catch { /* Use the card's message reply when direct access is unavailable. */ }
       const requestId = `${Date.now()}:${Math.random()}`;
       return new Promise(resolve => {
         const timer = setTimeout(() => {
@@ -1027,7 +1065,7 @@
           resolve(null);
         }, 1500);
         function onReply(event) {
-          if (event.origin !== location.origin || event.source !== card ||
+          if (event.origin !== location.origin ||
             event.data?.source !== 'cx-local-helper-flow' ||
             event.data?.type !== 'card-status' || event.data.requestId !== requestId) return;
           clearTimeout(timer);
@@ -1047,16 +1085,6 @@
         const card = await probeCardStatus();
         if (card?.num === expectedNum && card.knowledgeid === expectedId && card.finished) return true;
         await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-      return false;
-    }
-
-    async function waitForCardNum(expectedNum, timeout = 12000, expectedId = currentChapterId()) {
-      const started = Date.now();
-      while (isFlowOn() && Date.now() - started < timeout) {
-        const card = await probeCardStatus();
-        if (card?.num === expectedNum && card.knowledgeid === expectedId) return true;
-        await new Promise(resolve => setTimeout(resolve, 700));
       }
       return false;
     }
@@ -1081,21 +1109,45 @@
     }
 
     async function showCard(num, expectedId = currentChapterId()) {
-      const current = await probeCardStatus();
-      if (current?.num === num && current.knowledgeid === expectedId) return true;
+      function cardMatches() {
+        const src = document.querySelector('#iframe')?.getAttribute('src');
+        if (!src) return false;
+        const query = new URL(src, location.href).searchParams;
+        return query.get('num') === num && query.get('knowledgeid') === expectedId;
+      }
+      if (cardMatches()) return true;
       const card = document.querySelector(num === '0' ? '#dct1' : '#dct2');
       if (!card) return false;
       card.click();
-      if (await waitForCardNum(num, 15000, expectedId)) return true;
+      const started = Date.now();
+      while (isFlowOn() && !cardMatches() && Date.now() - started < 15000) await delay(500);
+      if (cardMatches()) return true;
       card.click();
-      return waitForCardNum(num, 15000, expectedId);
+      const retried = Date.now();
+      while (isFlowOn() && !cardMatches() && Date.now() - retried < 15000) await delay(500);
+      return cardMatches();
     }
 
-    async function waitForReadyCard(num, id, timeout = 30000) {
+    async function waitForReadyCard(num, id, timeout = 20000) {
       const started = Date.now();
       while (isFlowOn() && Date.now() - started < timeout) {
         const card = await probeCardStatus();
-        if (card?.num === num && card.knowledgeid === id && card.ready) return card;
+        if (card?.num === num && card.knowledgeid === id && card.ready) {
+          updateFlow({ pageReloadChapter: null, pageReloadCount: 0 });
+          return card;
+        }
+        if (Date.now() - started > 5000) {
+          const flow = flowState();
+          const count = flow?.pageReloadChapter === id ? flow.pageReloadCount || 0 : 0;
+          if (count < 2) {
+            updateFlow({ pageReloadChapter: id, pageReloadCount: count + 1,
+              targetChapterId: id });
+            showFlow('任务卡片暂时空白，正在刷新课程页恢复…');
+            location.reload();
+            return { reloading: true };
+          }
+          break;
+        }
         await delay(800);
       }
       return null;
@@ -1134,7 +1186,12 @@
       if (flow?.mode !== 'media-first') return;
       busy = true;
       try {
-        const items = chapters();
+        let items = chapters();
+        const catalogStarted = Date.now();
+        while (isFlowOn() && !items.length && Date.now() - catalogStarted < 20000) {
+          await delay(500);
+          items = chapters();
+        }
         if (!items.length) { halt('未找到课程目录，连续学习已停止。'); return; }
         const phase = flow.phase;
         const firstPending = items.find(item => !item.done);
@@ -1149,8 +1206,9 @@
         }
         if (!await goToChapter(id, phase === 'media' ? '0' : '1')) return;
         const card = await waitForReadyCard(phase === 'media' ? '0' : '1', id);
+        if (card?.reloading) return;
         if (!card) {
-          halt('当前任务点长时间未加载，连续学习已停止。');
+          halt('当前卡片未返回可用任务点状态，连续学习已停止。');
           return;
         }
         if (phase === 'media' && card?.finished) {
@@ -1186,8 +1244,10 @@
         const next = items.slice(current + 1).find(item => !item.done);
         if (next) {
           showFlow('本节媒体已完成，正在进入下一节媒体…');
+          await delay(1500);
+          const moved = await goToChapter(next.id, '0');
           busy = false;
-          if (await goToChapter(next.id, '0')) await resumeMediaFirst();
+          if (moved) await resumeMediaFirst();
           return;
         }
         const firstPending = items.find(item => !item.done);
@@ -1252,9 +1312,9 @@
         return;
       }
       showFlow('本节完成，正在进入下一节并核对跳转…');
+      const moved = await goToChapter(next.id, flowState()?.mode === 'media-first' ? '1' : '0');
       busy = false;
-      await goToChapter(next.id, flowState()?.mode === 'media-first' ? '1' : '0');
-      if (flowState()?.mode === 'media-first') resumeMediaFirst();
+      if (moved && flowState()?.mode === 'media-first') resumeMediaFirst();
     }
 
     window.addEventListener('message', event => {
@@ -1522,13 +1582,13 @@
 
   function initCardFlowProbe() {
     window.addEventListener('message', event => {
-      if (event.origin !== location.origin || event.source !== window.parent ||
+      if (event.origin !== location.origin ||
         event.data?.source !== 'cx-local-helper-flow' || event.data?.type !== 'probe-job') return;
       const icons = [...document.querySelectorAll('.ans-job-icon')];
       const finished = icons.length > 0 && icons.every(icon =>
         icon.classList.contains('ans-job-finished') ||
         /已完成/.test(icon.getAttribute('aria-label') || ''));
-      window.parent.postMessage({ source: 'cx-local-helper-flow', type: 'card-status',
+      event.source?.postMessage({ source: 'cx-local-helper-flow', type: 'card-status',
         requestId: event.data.requestId, finished, ready: icons.length > 0,
         num: new URLSearchParams(location.search).get('num'),
         knowledgeid: new URLSearchParams(location.search).get('knowledgeid') }, location.origin);
