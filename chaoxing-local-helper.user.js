@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通本地学习助手
 // @namespace    local.chaoxing.study-helper
-// @version      0.9.0
+// @version      0.9.1
 // @description  本地媒体控制、播放中弹题与章节测验的 DeepSeek 辅助
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        https://mooc1.chaoxing.com/mooc-ans/knowledge/*
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  document.documentElement.dataset.cxLocalHelperVersion = '0.9.0';
+  document.documentElement.dataset.cxLocalHelperVersion = '0.9.1';
 
   const STORE = 'cx-local-helper-bank-v1';
   const OPTIONS = 'cx-local-helper-options-v1';
@@ -1098,9 +1098,9 @@
       });
     }
 
-    async function waitForCardFinished(expectedNum, timeout = 90000) {
+    async function waitForCardFinished(expectedNum, timeout = 90000,
+      expectedId = currentChapterId()) {
       const started = Date.now();
-      const expectedId = currentChapterId();
       while (isFlowOn() && Date.now() - started < timeout) {
         if (expectedNum === '1' && chapterDone(expectedId)) return true;
         const card = await probeCardStatus();
@@ -1287,6 +1287,11 @@
       const items = chapters();
       if (!items.length) return;
       const id = currentChapterId();
+      const pendingId = flowState()?.pendingQuizChapterId;
+      if (pendingId && pendingId !== id) {
+        if (!chapterDone(pendingId)) return;
+        updateFlow({ pendingQuizChapterId: null, quizReloadCount: 0 });
+      }
       const card = await probeCardStatus();
       if (!isFlowOn() || busy || !card?.ready || card.knowledgeid !== id) return;
       if (chapterDone(id)) {
@@ -1346,27 +1351,31 @@
       if (busy || !isFlowOn()) return;
       busy = true;
       clearTimeout(quizTimer);
+      const submittedId = flowState()?.pendingQuizChapterId || currentChapterId();
       const confirmStarted = Date.now();
       while (isFlowOn() && Date.now() - confirmStarted < 15000) {
         if (confirmQuizDialog()) {
           showFlow('确认提交章节测验…');
           break;
         }
-        if (chapterDone() || (await probeCardStatus())?.finished) break;
+        const card = await probeCardStatus();
+        if (chapterDone(submittedId) ||
+          (card?.knowledgeid === submittedId && card.num === '1' && card.finished)) break;
         await new Promise(resolve => setTimeout(resolve, 250));
       }
       showFlow('测验已提交，等待平台确认任务点完成…');
-      let confirmed = await waitForCardFinished('1', 30000);
+      let confirmed = await waitForCardFinished('1', 30000, submittedId);
       for (let attempt = 0; !confirmed && attempt < 2 && isFlowOn(); attempt++) {
+        if (currentChapterId() !== submittedId) break;
         if (!document.querySelector('#dct1') || !document.querySelector('#dct2')) break;
         showFlow('正在刷新测验任务点状态…');
         if (!await showCard('0')) break;
         if (!await showCard('1')) break;
-        confirmed = await waitForCardFinished('1', 30000);
+        confirmed = await waitForCardFinished('1', 30000, submittedId);
       }
       if (!confirmed) {
         const flow = flowState();
-        if (flow?.pendingQuizChapterId === currentChapterId() &&
+        if (flow?.pendingQuizChapterId === submittedId &&
           (flow.quizReloadCount || 0) < 1) {
           updateFlow({ quizReloadCount: 1 });
           showFlow('测验完成状态尚未同步，正在刷新课程页复查…');
@@ -1379,8 +1388,15 @@
         return;
       }
       updateFlow({ pendingQuizChapterId: null, quizReloadCount: 0 });
+      if (currentChapterId() !== submittedId) {
+        showFlow('测验已完成，页面已进入下一节，正在核对当前任务…');
+        busy = false;
+        if (flowState()?.mode === 'media-first') resumeMediaFirst();
+        else resumeChapterFlow();
+        return;
+      }
       const items = chapters();
-      const current = items.findIndex(item => item.id === currentChapterId());
+      const current = items.findIndex(item => item.id === submittedId);
       const next = items.slice(current + 1).find(item => !item.done) ||
         items.slice(0, current).find(item => !item.done);
       if (!next) {
