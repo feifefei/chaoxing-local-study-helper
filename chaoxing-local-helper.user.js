@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通本地学习助手
 // @namespace    local.chaoxing.study-helper
-// @version      0.8.9
+// @version      0.9.0
 // @description  本地媒体控制、播放中弹题与章节测验的 DeepSeek 辅助
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        https://mooc1.chaoxing.com/mooc-ans/knowledge/*
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  document.documentElement.dataset.cxLocalHelperVersion = '0.8.9';
+  document.documentElement.dataset.cxLocalHelperVersion = '0.9.0';
 
   const STORE = 'cx-local-helper-bank-v1';
   const OPTIONS = 'cx-local-helper-options-v1';
@@ -111,7 +111,8 @@
   function startFlow(mode = 'chapter') {
     sessionStorage.setItem(FLOW_KEY, JSON.stringify({
       expiresAt: Date.now() + 24 * 60 * 60 * 1000,
-      mode, phase: mode === 'media-first' ? 'media' : 'chapter'
+      mode, phase: mode === 'media-first' ? 'media' : 'chapter',
+      mediaCompletedIds: [], pendingQuizChapterId: null, quizReloadCount: 0
     }));
     if (flowButton) flowButton.textContent = '停止连续学习';
     if (mediaFirstButton) mediaFirstButton.textContent = '停止连续学习';
@@ -571,6 +572,14 @@
       return;
     }
     sessionStorage.setItem(SUBMIT_KEY, attemptId);
+    let quizChapterId = new URLSearchParams(location.search).get('knowledgeid');
+    if (!quizChapterId) {
+      try {
+        const cardSrc = window.top.document.querySelector('#iframe')?.getAttribute('src');
+        quizChapterId = cardSrc && new URL(cardSrc, location.href).searchParams.get('knowledgeid');
+      } catch { /* The card URL may be unavailable while submitting. */ }
+    }
+    updateFlow({ pendingQuizChapterId: quizChapterId });
     quizSubmitting = true;
     message(`已填选 ${infos.length} 题，正在提交并等待任务点完成。`);
     submit.click();
@@ -732,7 +741,16 @@
       media.addEventListener('play', renderMedia);
       media.addEventListener('pause', () => {
         renderMedia();
-        if (!media.ended) message('播放已暂停。学习通可能在切出页面时主动暂停，请保持学习页在前台。');
+        if (!media.ended) {
+          message('播放已暂停。学习通可能在切出页面时主动暂停，请保持学习页在前台。');
+          if (isFlowOn() && isMediaModule()) {
+            setTimeout(() => {
+              if (!isFlowOn() || !media.isConnected || !media.paused || media.ended) return;
+              flowMediaAttempted.delete(media);
+              startFlowMedia();
+            }, 12000);
+          }
+        }
       });
       if (preferences.mute) media.muted = true;
     }
@@ -1026,7 +1044,9 @@
         badge.append(badgeText, stop);
         document.body.append(badge);
       }
-      badgeText.textContent = text;
+      const count = flowState()?.mediaCompletedIds?.length || 0;
+      badge.dataset.completedMediaCount = String(count);
+      badgeText.textContent = `${text}${count ? `（本次已核对视频 ${count} 段）` : ''}`;
     }
 
     function isCurrentCardSource(source) {
@@ -1082,6 +1102,7 @@
       const started = Date.now();
       const expectedId = currentChapterId();
       while (isFlowOn() && Date.now() - started < timeout) {
+        if (expectedNum === '1' && chapterDone(expectedId)) return true;
         const card = await probeCardStatus();
         if (card?.num === expectedNum && card.knowledgeid === expectedId && card.finished) return true;
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1106,6 +1127,38 @@
         .filter(node => /^cur\d+$/.test(node.id))
         .map(node => ({ id: node.id.slice(3), node,
           done: !!node.querySelector('.icon_Completed') }));
+    }
+
+    function chapterDone(id = currentChapterId()) {
+      return !!id && !!document.querySelector(`#cur${id} .icon_Completed`);
+    }
+
+    function recordMediaCompleted(id = currentChapterId()) {
+      if (!id || !isFlowOn()) return;
+      const completed = flowState()?.mediaCompletedIds || [];
+      if (completed.includes(id)) return;
+      updateFlow({ mediaCompletedIds: [...completed, id] });
+      if (badgeText) showFlow(badgeText.textContent.replace(/（本次已核对视频 \d+ 段）$/, ''));
+    }
+
+    function confirmQuizDialog() {
+      const docs = [document];
+      for (let index = 0; index < docs.length && index < 8; index++) {
+        for (const frame of docs[index].querySelectorAll('iframe')) {
+          try { if (frame.contentDocument?.documentElement) docs.push(frame.contentDocument); }
+          catch { /* A cross-origin frame cannot contain the course confirmation dialog. */ }
+        }
+      }
+      for (const doc of docs) {
+        const prompt = doc.querySelector('#popcontent');
+        const okay = doc.querySelector('#popok');
+        if (prompt && okay && /提交|确认|确定/.test(prompt.textContent || '') &&
+          okay.getBoundingClientRect().width > 0) {
+          okay.click();
+          return true;
+        }
+      }
+      return false;
     }
 
     async function showCard(num, expectedId = currentChapterId()) {
@@ -1229,6 +1282,23 @@
       } finally { busy = false; }
     }
 
+    async function resumeChapterFlow() {
+      if (busy || !isFlowOn() || flowState()?.mode === 'media-first') return;
+      const items = chapters();
+      if (!items.length) return;
+      const id = currentChapterId();
+      const card = await probeCardStatus();
+      if (!isFlowOn() || busy || !card?.ready || card.knowledgeid !== id) return;
+      if (chapterDone(id)) {
+        moveToNext();
+      } else if (card.num === '0' && card.finished) {
+        moveToQuiz();
+      } else if (card.num === '1' &&
+        flowState()?.pendingQuizChapterId === id) {
+        moveToNext();
+      }
+    }
+
     async function moveToQuiz() {
       if (busy || !isFlowOn()) return;
       busy = true;
@@ -1238,6 +1308,7 @@
         busy = false;
         return;
       }
+      recordMediaCompleted();
       if (mediaFirstPhase()) {
         const items = chapters();
         const current = items.findIndex(item => item.id === currentChapterId());
@@ -1277,35 +1348,41 @@
       clearTimeout(quizTimer);
       const confirmStarted = Date.now();
       while (isFlowOn() && Date.now() - confirmStarted < 15000) {
-        const prompt = document.querySelector('#popcontent');
-        const okay = document.querySelector('#popok');
-        if (prompt && okay && /提交|确认|确定/.test(prompt.textContent || '') &&
-          okay.getBoundingClientRect().width > 0) {
+        if (confirmQuizDialog()) {
           showFlow('确认提交章节测验…');
-          okay.click();
           break;
         }
-        if ((await probeCardStatus())?.finished) break;
+        if (chapterDone() || (await probeCardStatus())?.finished) break;
         await new Promise(resolve => setTimeout(resolve, 250));
       }
       showFlow('测验已提交，等待平台确认任务点完成…');
       let confirmed = await waitForCardFinished('1', 30000);
       for (let attempt = 0; !confirmed && attempt < 2 && isFlowOn(); attempt++) {
-        const quiz = document.querySelector('#dct2');
-        if (!quiz) break;
+        if (!document.querySelector('#dct1') || !document.querySelector('#dct2')) break;
         showFlow('正在刷新测验任务点状态…');
-        quiz.click();
+        if (!await showCard('0')) break;
+        if (!await showCard('1')) break;
         confirmed = await waitForCardFinished('1', 30000);
       }
       if (!confirmed) {
+        const flow = flowState();
+        if (flow?.pendingQuizChapterId === currentChapterId() &&
+          (flow.quizReloadCount || 0) < 1) {
+          updateFlow({ quizReloadCount: 1 });
+          showFlow('测验完成状态尚未同步，正在刷新课程页复查…');
+          location.reload();
+          busy = false;
+          return;
+        }
         halt('测验提交后未确认完成，连续学习已停止，请检查页面。');
         busy = false;
         return;
       }
+      updateFlow({ pendingQuizChapterId: null, quizReloadCount: 0 });
       const items = chapters();
       const current = items.findIndex(item => item.id === currentChapterId());
-      const next = items.slice(current + 1).find(item =>
-        flowState()?.mode !== 'media-first' || !item.done);
+      const next = items.slice(current + 1).find(item => !item.done) ||
+        items.slice(0, current).find(item => !item.done);
       if (!next) {
         halt('已到课程末尾，连续学习已完成。');
         busy = false;
@@ -1315,6 +1392,7 @@
       const moved = await goToChapter(next.id, flowState()?.mode === 'media-first' ? '1' : '0');
       busy = false;
       if (moved && flowState()?.mode === 'media-first') resumeMediaFirst();
+      else if (moved) resumeChapterFlow();
     }
 
     window.addEventListener('message', event => {
@@ -1325,10 +1403,8 @@
         showFlow('连续学习已启动，等待当前任务点完成…');
         if (flowState()?.mode === 'media-first') {
           resumeMediaFirst();
-        } else if (document.querySelector('#dct1.active')) {
-          probeCardStatus().then(card => {
-            if (card?.num === '0' && card.finished && isFlowOn()) moveToQuiz();
-          });
+        } else {
+          resumeChapterFlow();
         }
       }
       else if (type === 'stopped') halt(detail || '连续学习已停止。');
@@ -1353,7 +1429,11 @@
     if (isFlowOn()) {
       showFlow('连续学习运行中，等待当前任务点加载…');
       if (flowState()?.mode === 'media-first') setTimeout(resumeMediaFirst, 0);
+      else setTimeout(resumeChapterFlow, 0);
     }
+    setInterval(() => {
+      if (isFlowOn() && flowState()?.mode !== 'media-first') resumeChapterFlow();
+    }, 12000);
   }
 
   function initPlaybackQuiz() {
